@@ -1,0 +1,65 @@
+name: sync
+
+# Publishes the wheels of the latest successful build of the branch `develop`
+# of sys-bio/roadrunner as a release of this repository and writes the package
+# index of all releases to GitHub Pages.
+on:
+  schedule:
+    # daily, after the builds of the night
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+    inputs:
+      run:
+        description: "The id of a run of BuildRoadRunner to publish instead of the latest"
+        required: false
+        default: ""
+  push:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: sync
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+    - name: Publish the wheels of the latest build of develop
+      env:
+        GH_TOKEN: ${{ github.token }}
+        RUN: ${{ inputs.run }}
+      run: python3 sync.py publish ${RUN:+--run "$RUN"}
+
+  pages:
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+    - name: Write the package index of the releases
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: python3 sync.py index --out site
+    - uses: actions/configure-pages@v6
+    - uses: actions/upload-pages-artifact@v5
+      with:
+        path: site
+    - id: deployment
+      uses: actions/deploy-pages@v5
