@@ -1,8 +1,10 @@
 name: sync
 
 # Publishes the wheels of the latest successful build of the branch `develop`
-# of sys-bio/roadrunner as a release of this repository and writes the package
-# index of all releases to GitHub Pages.
+# of sys-bio/roadrunner as a release of this repository, writes the package
+# index of all releases to GitHub Pages and, as the last step, installs the
+# published build from the index with uv and with pip on python 3.14 and 3.15
+# on every platform and simulates with it.
 on:
   schedule:
     # daily, after the builds of the night
@@ -28,11 +30,14 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: write
+    outputs:
+      version: ${{ steps.publish.outputs.version }}
     steps:
     - uses: actions/checkout@v7
       with:
         persist-credentials: false
     - name: Publish the wheels of the latest build of develop
+      id: publish
       env:
         GH_TOKEN: ${{ github.token }}
         RUN: ${{ inputs.run }}
@@ -63,3 +68,38 @@ jobs:
         path: site
     - id: deployment
       uses: actions/deploy-pages@v5
+
+  check:
+    # the published build from the index, as a user installs it (README):
+    # `uv sync` of a project with the source and `pip install
+    # --extra-index-url`, on the pythons of uv; the installed version must be
+    # the published one, so the index serves the newest build
+    name: check (${{ matrix.os }}, python ${{ matrix.python }}, ${{ matrix.installer }})
+    needs: [publish, pages]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, macos-15-intel, windows-latest]
+        python: ["3.14", "3.15"]
+        installer: [uv, pip]
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+    - uses: astral-sh/setup-uv@v10
+      with:
+        enable-cache: false
+    - name: Install the published build and simulate
+      env:
+        VERSION: ${{ needs.publish.outputs.version }}
+        INSTALLER: ${{ matrix.installer }}
+        PYTHON: ${{ matrix.python }}
+      # GitHub Pages caches its pages for up to ten minutes
+      run: >-
+        uv run --no-project --python 3.14 check_install.py
+        --installer "$INSTALLER" --python "$PYTHON" --version "$VERSION" --wait 900
+      shell: bash

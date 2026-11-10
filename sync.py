@@ -55,7 +55,7 @@ BRANCH = "develop"
 PACKAGES = ("libroadrunner", "rrplugins")
 # the artifacts of the wheels which an index serves: manylinux and not the
 # wheels of a single distribution (`ubuntu-26`), which are no portable wheels
-ARTIFACT = re.compile(r"^roadrunner-.+-python-wheels-(manylinux|macos|windows)")
+ARTIFACT = re.compile(r"^roadrunner-(?P<version>[^-]+)-python-wheels-(manylinux|macos|windows)")
 # a build is published only with a wheel of every package for every platform
 PLATFORMS = ("manylinux", "macosx_*_arm64", "macosx_*_x86_64", "win_amd64")
 REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "matthiaskoenig/roadrunner-wheels")
@@ -175,7 +175,8 @@ def reversion(wheel: Path, version: str, out: Path) -> Path:
                 if n != 1:
                     raise ValueError(f"no version in the metadata of {wheel.name}")
             elif name == dist_info + "WHEEL":
-                lines = [ln for ln in data.decode().splitlines() if ln and not ln.startswith("Tag:")]
+                lines = data.decode().splitlines()
+                lines = [ln for ln in lines if ln and not ln.startswith("Tag:")]
                 lines += [f"Tag: {tag}" for tag in new.tags]
                 data = ("\n".join(lines) + "\n").encode()
             copy = zipfile.ZipInfo(name, date_time=info.date_time)
@@ -332,12 +333,21 @@ def existing_tags() -> set[str]:
     return {r["tag_name"] for r in gh_items(f"repos/{REPOSITORY}/releases?per_page=100")}
 
 
-def download_wheels(run_id: int, directory: Path) -> list[Path]:
-    """Download the wheel artifacts of a run, one wheel per package and platform."""
-    artifacts = gh_items(
-        f"repos/{UPSTREAM}/actions/runs/{run_id}/artifacts?per_page=100", "artifacts"
-    )
-    names = [a["name"] for a in artifacts if ARTIFACT.match(a["name"]) and not a["expired"]]
+def wheel_artifacts(run_id: int) -> dict[str, str]:
+    """The wheel artifacts of a run, by name, with the version of the branch."""
+    path = f"repos/{UPSTREAM}/actions/runs/{run_id}/artifacts?per_page=100"
+    found = {}
+    for artifact in gh_items(path, "artifacts"):
+        match = ARTIFACT.match(artifact["name"])
+        if match and not artifact["expired"]:
+            found[artifact["name"]] = match["version"]
+    if len(set(found.values())) != 1:
+        raise SystemExit(f"run {run_id} has no wheel artifacts of one version: {found}")
+    return found
+
+
+def download_wheels(run_id: int, names: list[str], directory: Path) -> list[Path]:
+    """Download wheel artifacts of a run, one wheel per package and platform."""
     for name in names:
         gh("run", "download", str(run_id), "-R", UPSTREAM, "-n", name, "-D", str(directory / name))
     wheels = [w for w in directory.rglob("*.whl") if WheelName.parse(w.name).name in PACKAGES]
@@ -367,20 +377,34 @@ def _check_complete(wheels: list[Path]) -> None:
         raise SystemExit("the build has several wheels of one package and platform")
 
 
+def github_output(name: str, value: str) -> None:
+    """Set an output of the step of a workflow (outside of one, print it)."""
+    path = os.environ.get("GITHUB_OUTPUT")
+    if path:
+        with open(path, "a") as f:
+            f.write(f"{name}={value}\n")
+    else:
+        print(f"{name}={value}")
+
+
 def publish(run_id: int | None, dry_run: bool) -> None:
     """Publish the wheels of a run (the latest successful one by default)."""
     run = gh_api(f"repos/{UPSTREAM}/actions/runs/{run_id}") if run_id else latest_run()
     if (run["head_branch"], run["event"], run["conclusion"]) != (BRANCH, "push", "success"):
         raise SystemExit(f"run {run['id']} is no successful push to {BRANCH}")
+    artifacts = wheel_artifacts(run["id"])
+    base = next(iter(artifacts.values()))
+    version = build_version(base, run["run_number"], released_on_pypi("libroadrunner", base))
+    tag = f"v{version}"
+    github_output("version", version)
+    if tag in existing_tags():
+        print(f"{tag} is published already")
+        return
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
-        wheels = download_wheels(run["id"], tmp_path / "artifacts")
-        base = WheelName.parse(wheels[0].name).version
-        version = build_version(base, run["run_number"], released_on_pypi("libroadrunner", base))
-        tag = f"v{version}"
-        if tag in existing_tags():
-            print(f"{tag} is published already")
-            return
+        wheels = download_wheels(run["id"], sorted(artifacts), tmp_path / "artifacts")
+        if WheelName.parse(wheels[0].name).version != base:
+            raise SystemExit(f"the wheels of run {run['id']} are not of version {base}")
         out = tmp_path / "wheels"
         assets = []
         for wheel in wheels:
