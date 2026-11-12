@@ -8,7 +8,29 @@ successful build a version of their own and keeps them as the assets of a
 release of this repository, from which it writes a static package index
 (PEP 503, with the core metadata of PEP 658), served by GitHub Pages.
 
-The version of a build is `<version>.dev<run number>`, or
+The builds come in two channels, each with an index of its own: `develop`, the
+branch of sys-bio/roadrunner, and `patched`, the branch `develop-patched` of
+the fork matthiaskoenig/roadrunner, which is that same develop with the
+patches we carry on top (the pull requests of ours which are not merged yet)
+and is built by a dispatch of `BuildRoadRunner` on the fork. A channel has its
+own releases (the prefix of their tags) and its own index, so a wheel of the
+fork is never mistaken for a build of upstream. Our own projects pin
+libroadrunner to the index of `patched`, so every simulation of ours runs on
+the patches.
+
+The version of a build of `patched` is the one of the build of `develop` of
+upstream the patches sit on with the local version segment `+patched.<run of
+the fork>`, e.g. `2.11.1.dev655+patched.3`: the run numbers of the fork are a
+sequence of its own which starts at 1, and taking them would sort a build of
+patches below every build of upstream and below the floor of a project which
+requires one, while the number of the build of upstream sorts it right above
+that build and below every later one (`base_run_number`, `--base-run`). A
+build of `patched` is published although its run failed and although it has
+no wheel for every platform (the macos-intel jobs of the fork fail), with the
+platforms it built and both stated in its release notes, since the patches
+are tested by the project which uses them.
+
+The version of a build of `develop` is `<version>.dev<run number>`, or
 `<version>.post0.dev<run number>` once `<version>` is released on PyPI, a
 development release which sorts after every earlier build and, as long as the
 version of `develop` is not released, before the release. A development
@@ -21,7 +43,8 @@ file `WHEEL` set to the ones of the name of the wheel.
 
 Commands (standard library only, `gh` on the path with a token in `GH_TOKEN`):
 
-    python sync.py publish [--run RUN_ID] [--dry-run]
+    python sync.py publish [--channel develop|patched] [--run RUN_ID]
+        [--base-run RUN_NUMBER] [--dry-run]
     python sync.py index --out SITE
     python sync.py reversion WHEEL VERSION --out DIR
     python sync.py local-index WHEELS_DIR --out SITE
@@ -50,16 +73,91 @@ from email.parser import BytesHeaderParser
 from pathlib import Path
 
 UPSTREAM = "sys-bio/roadrunner"
+FORK = "matthiaskoenig/roadrunner"
 WORKFLOW = "main.yml"
 BRANCH = "develop"
+#: the branch of the fork: develop with the patches we carry on top
+PATCHED_BRANCH = "develop-patched"
 PACKAGES = ("libroadrunner", "rrplugins")
 # the artifacts of the wheels which an index serves: manylinux and not the
 # wheels of a single distribution (`ubuntu-26`), which are no portable wheels
 ARTIFACT = re.compile(r"^roadrunner-(?P<version>[^-]+)-python-wheels-(manylinux|macos|windows)")
 # a build is published only with a wheel of every package for every platform
 PLATFORMS = ("manylinux", "macosx_*_arm64", "macosx_*_x86_64", "win_amd64")
+# the runner on which the check of the workflow installs the wheel of a
+# platform: a build without the wheel of a platform, which a channel of our
+# patches publishes, is not checked on its runner (the output `runners`)
+RUNNERS = {
+    "manylinux": "ubuntu-latest",
+    "macosx_*_arm64": "macos-latest",
+    "macosx_*_x86_64": "macos-15-intel",
+    "win_amd64": "windows-latest",
+}
+# the builds of `develop` of upstream which are searched for the one a build
+# of patches sits on (`base_run_number`)
+BASE_RUNS = 30
 REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "matthiaskoenig/roadrunner-wheels")
 PAGES_URL = "https://matthiaskoenig.github.io/roadrunner-wheels"
+
+
+@dataclass(frozen=True)
+class Channel:
+    """A branch whose builds this repository publishes as an index of its own."""
+
+    #: the name of the channel, the argument of `--channel`
+    name: str
+    #: the repository the build runs in
+    repo: str
+    #: the branch which is built
+    branch: str
+    #: the event of the run which is published
+    event: str
+    #: the local version segment of every build, `None` for none
+    local: str | None
+    #: the directory of the index below the site
+    index: str
+    #: the prefix of the tag of a release of this channel
+    tag_prefix: str
+    #: what the channel is, for the index and the release notes
+    description: str
+    #: whether the run must have concluded `success`: a build of our patches
+    #: is published when a job of a platform failed as well (the macos-intel
+    #: jobs of the fork do), with the platforms it built
+    require_success: bool = True
+    #: whether the build must have a wheel of every package and platform
+    require_complete: bool = True
+
+
+CHANNELS: dict[str, Channel] = {
+    channel.name: channel
+    for channel in (
+        Channel(
+            name="develop",
+            repo=UPSTREAM,
+            branch=BRANCH,
+            event="push",
+            local=None,
+            index="simple",
+            tag_prefix="v",
+            description=f"the branch `{BRANCH}` of {UPSTREAM}",
+        ),
+        Channel(
+            name="patched",
+            repo=FORK,
+            branch=PATCHED_BRANCH,
+            event="workflow_dispatch",
+            local="patched",
+            index="simple-patched",
+            tag_prefix="patched-v",
+            description=(
+                f"the branch `{PATCHED_BRANCH}` of {FORK}, i.e. the branch "
+                f"`{BRANCH}` of {UPSTREAM} with the patches we carry on top"
+            ),
+            require_success=False,
+            require_complete=False,
+        ),
+    )
+}
 
 
 def gh(*args: str) -> str:
@@ -93,11 +191,19 @@ def released_on_pypi(package: str, version: str) -> bool:
         raise
 
 
-def build_version(version: str, run_number: int, released: bool) -> str:
-    """The version of the build `run_number` of the branch at `version`."""
+def build_version(
+    version: str, run_number: int, released: bool, local: str | None = None
+) -> str:
+    """The version of the build `run_number` of the branch at `version`.
+
+    A channel with a local version segment (`patched`) appends it, so its
+    builds are never confused with the builds of upstream and an index which
+    serves both keeps them apart.
+    """
     if not re.fullmatch(r"\d+(\.\d+)*", version):
         raise ValueError(f"not a final release version: {version!r}")
-    return f"{version}.post0.dev{run_number}" if released else f"{version}.dev{run_number}"
+    base = f"{version}.post0.dev{run_number}" if released else f"{version}.dev{run_number}"
+    return f"{base}+{local}" if local else base
 
 
 # --- wheels ----------------------------------------------------------------
@@ -241,12 +347,24 @@ def _project_page(name: str, files: list[IndexFile]) -> str:
     )
 
 
-def write_index(files: list[IndexFile], out: Path) -> None:
-    """Write the simple index of `files` into `out/simple` and a front page."""
+def write_index(
+    files: list[IndexFile], out: Path, channel: Channel | None = None
+) -> dict[str, str]:
+    """Write the simple index of `files` into the directory of the channel.
+
+    Args:
+        files: the wheels of the channel.
+        out: the directory of the site.
+        channel: the channel, the one of upstream by default.
+
+    Returns:
+        The newest wheel of every package of the channel, by package.
+    """
+    channel = channel or CHANNELS["develop"]
     projects: dict[str, list[IndexFile]] = {}
     for f in files:
         projects.setdefault(WheelName.parse(f.filename).name.replace("_", "-"), []).append(f)
-    simple = out / "simple"
+    simple = out / channel.index
     simple.mkdir(parents=True, exist_ok=True)
     for name, project_files in projects.items():
         (simple / name).mkdir(exist_ok=True)
@@ -258,18 +376,38 @@ def write_index(files: list[IndexFile], out: Path) -> None:
         "    <title>Simple index</title>\n  </head>\n  <body>\n"
         f"{entries}\n  </body>\n</html>\n"
     )
-    readme = Path(__file__).with_name("README.md")
-    latest = {
+    return {
         name: max(project_files, key=lambda f: f.filename).filename
         for name, project_files in projects.items()
     }
+
+
+def write_front_page(latest: dict[str, dict[str, str]], out: Path) -> None:
+    """Write the front page of the site, the channels with their newest wheels.
+
+    Args:
+        latest: the newest wheel of every package, by channel and package.
+        out: the directory of the site.
+    """
+    sections = []
+    for name, wheels in latest.items():
+        channel = CHANNELS[name]
+        # the backticks of the description are markdown, for the release notes
+        description = html.escape(channel.description.replace("`", ""))
+        newest = html.escape(", ".join(sorted(wheels.values()))) or "no build yet"
+        sections.append(
+            f"    <h2>{html.escape(name)}</h2>\n"
+            f"    <p>{description}</p>\n"
+            f"    <p>Package index: <code>{PAGES_URL}/{channel.index}/</code></p>\n"
+            f"    <p>Latest: {newest}</p>\n"
+        )
+    readme = Path(__file__).with_name("README.md")
     (out / "index.html").write_text(
         '<!DOCTYPE html>\n<html>\n  <head>\n    <meta charset="utf-8">\n'
         "    <title>libRoadRunner develop wheels</title>\n  </head>\n  <body>\n"
         "    <h1>libRoadRunner develop wheels</h1>\n"
-        f"    <p>Package index: <code>{PAGES_URL}/simple/</code></p>\n"
-        f"    <p>Latest: {html.escape(', '.join(sorted(latest.values())))}</p>\n"
-        f'    <p>See <a href="https://github.com/{REPOSITORY}">{REPOSITORY}</a>'
+        + "".join(sections)
+        + f'    <p>See <a href="https://github.com/{REPOSITORY}">{REPOSITORY}</a>'
         " for how to use it.</p>\n"
         "  </body>\n</html>\n"
     )
@@ -278,11 +416,25 @@ def write_index(files: list[IndexFile], out: Path) -> None:
     (out / ".nojekyll").write_text("")
 
 
-def release_files() -> list[IndexFile]:
-    """The wheels of every release of this repository with their hashes."""
+def release_files(channel: Channel | None = None) -> list[IndexFile]:
+    """The wheels of every release of a channel with their hashes.
+
+    Args:
+        channel: the channel, whose releases are those whose tag carries its
+            prefix; the one of upstream by default.
+    """
+    channel = channel or CHANNELS["develop"]
+    other = sorted(
+        (c.tag_prefix for c in CHANNELS.values() if c is not channel), key=len, reverse=True
+    )
     files = []
     for release in gh_items(f"repos/{REPOSITORY}/releases?per_page=100"):
         if release["draft"]:
+            continue
+        tag = release["tag_name"]
+        if not tag.startswith(channel.tag_prefix) or any(
+            tag.startswith(prefix) for prefix in other
+        ):
             continue
         assets = {a["name"]: a for a in release["assets"]}
         for name, asset in assets.items():
@@ -317,14 +469,19 @@ def _asset_sha256(asset: dict) -> str:
 # --- publishing ------------------------------------------------------------
 
 
-def latest_run() -> dict:
-    """The latest successful run of the workflow of a push to the branch."""
+def latest_run(channel: Channel) -> dict:
+    """The latest run of the workflow of the branch of a channel.
+
+    The latest successful one, or, for a channel which does not require a
+    successful run (`patched`), the latest completed one.
+    """
+    status = "success" if channel.require_success else "completed"
     runs = gh_api(
-        f"repos/{UPSTREAM}/actions/workflows/{WORKFLOW}/runs"
-        f"?branch={BRANCH}&event=push&status=success&per_page=1"
+        f"repos/{channel.repo}/actions/workflows/{WORKFLOW}/runs"
+        f"?branch={channel.branch}&event={channel.event}&status={status}&per_page=1"
     )["workflow_runs"]
     if not runs:
-        raise SystemExit(f"no successful run of {WORKFLOW} on {BRANCH}")
+        raise SystemExit(f"no {status} run of {WORKFLOW} on {channel.branch}")
     return runs[0]
 
 
@@ -333,9 +490,9 @@ def existing_tags() -> set[str]:
     return {r["tag_name"] for r in gh_items(f"repos/{REPOSITORY}/releases?per_page=100")}
 
 
-def wheel_artifacts(run_id: int) -> dict[str, str]:
+def wheel_artifacts(channel: Channel, run_id: int) -> dict[str, str]:
     """The wheel artifacts of a run, by name, with the version of the branch."""
-    path = f"repos/{UPSTREAM}/actions/runs/{run_id}/artifacts?per_page=100"
+    path = f"repos/{channel.repo}/actions/runs/{run_id}/artifacts?per_page=100"
     found = {}
     for artifact in gh_items(path, "artifacts"):
         match = ARTIFACT.match(artifact["name"])
@@ -346,16 +503,47 @@ def wheel_artifacts(run_id: int) -> dict[str, str]:
     return found
 
 
-def download_wheels(run_id: int, names: list[str], directory: Path) -> list[Path]:
-    """Download wheel artifacts of a run, one wheel per package and platform."""
+def download_wheels(
+    channel: Channel, run_id: int, names: list[str], directory: Path
+) -> tuple[list[Path], list[str]]:
+    """Download wheel artifacts of a run, one wheel per package and platform.
+
+    Returns:
+        The wheels and the packages and platforms the build has no wheel for,
+        which is empty unless the channel publishes an incomplete build.
+    """
     for name in names:
-        gh("run", "download", str(run_id), "-R", UPSTREAM, "-n", name, "-D", str(directory / name))
+        gh(
+            "run",
+            "download",
+            str(run_id),
+            "-R",
+            channel.repo,
+            "-n",
+            name,
+            "-D",
+            str(directory / name),
+        )
     wheels = [w for w in directory.rglob("*.whl") if WheelName.parse(w.name).name in PACKAGES]
-    _check_complete(wheels)
-    return wheels
+    missing = _check_complete(wheels, channel.require_complete)
+    return wheels, missing
 
 
-def _check_complete(wheels: list[Path]) -> None:
+def _check_complete(wheels: list[Path], required: bool = True) -> list[str]:
+    """Check that a build has a wheel of every package and platform.
+
+    Args:
+        wheels: the wheels of the build.
+        required: whether a missing wheel is an error; a channel of our
+            patches publishes the platforms which built.
+
+    Returns:
+        The packages and platforms which are missing, `package/platform`.
+
+    Raises:
+        SystemExit: when a wheel is missing and `required`, and always for
+            wheels of several versions or two wheels of one platform.
+    """
     from fnmatch import fnmatch
 
     found = {(WheelName.parse(w.name).name, WheelName.parse(w.name).platform) for w in wheels}
@@ -368,13 +556,17 @@ def _check_complete(wheels: list[Path]) -> None:
             for p, plats in found
         )
     ]
+    names = [f"{package}/{platform}" for package, platform in missing]
+    if missing and required:
+        raise SystemExit(f"the build has no wheel for {names}")
     if missing:
-        raise SystemExit(f"the build has no wheel for {missing}")
+        print(f"the build has no wheel for {names}, publishing the rest")
     versions = {WheelName.parse(w.name).version for w in wheels}
     if len(versions) != 1:
         raise SystemExit(f"the wheels of a build have several versions: {versions}")
     if len(found) != len(wheels):
         raise SystemExit("the build has several wheels of one package and platform")
+    return names
 
 
 def github_output(name: str, value: str) -> None:
@@ -387,22 +579,158 @@ def github_output(name: str, value: str) -> None:
         print(f"{name}={value}")
 
 
-def publish(run_id: int | None, dry_run: bool) -> None:
-    """Publish the wheels of a run (the latest successful one by default)."""
-    run = gh_api(f"repos/{UPSTREAM}/actions/runs/{run_id}") if run_id else latest_run()
-    if (run["head_branch"], run["event"], run["conclusion"]) != (BRANCH, "push", "success"):
-        raise SystemExit(f"run {run['id']} is no successful push to {BRANCH}")
-    artifacts = wheel_artifacts(run["id"])
+def base_run_number(channel: Channel, head_sha: str, base_run: int | None = None) -> int:
+    """The number of the build of upstream a build of patches sits on.
+
+    The run numbers of a fork are a sequence of its own which starts at 1, so
+    the number of the run which built the patches would sort the build below
+    every build of upstream and below the floor of a project which requires
+    one. The version of a build of patches takes the number of the build of
+    `develop` of upstream the patches sit on instead: the build of the merge
+    base of the branch, or the newest build of `develop` which the branch
+    contains, and the run of the fork goes into the local version segment
+    (`build_number`). The version then sorts right above that build of
+    upstream and below every later one, so a resolution which asks for the
+    newest build never takes a build of patches, while a project which pins
+    the version gets it and the floor of upstream is satisfied.
+
+    Args:
+        channel: the channel of the build, a channel of a fork.
+        head_sha: the commit which was built.
+        base_run: the number to use instead of looking it up.
+
+    Returns:
+        The run number of the build of upstream.
+
+    Raises:
+        SystemExit: when no build of `develop` which the branch contains is
+            among the `BASE_RUNS` newest ones.
+    """
+    if base_run is not None:
+        return base_run
+    owner = channel.repo.split("/")[0]
+    comparison = gh_api(f"repos/{UPSTREAM}/compare/{BRANCH}...{owner}:{head_sha}")
+    merge_base = comparison["merge_base_commit"]["sha"]
+    runs = gh_api(
+        f"repos/{UPSTREAM}/actions/workflows/{WORKFLOW}/runs"
+        f"?branch={BRANCH}&event=push&status=success&per_page={BASE_RUNS}"
+    )["workflow_runs"]
+    for run in runs:
+        if run["head_sha"] == merge_base:
+            return run["run_number"]
+    # the merge base was not built: the newest build it contains, i.e. the
+    # newest commit of `develop` with a build which is an ancestor of it
+    for run in runs:
+        status = gh_api(f"repos/{UPSTREAM}/compare/{run['head_sha']}...{merge_base}")
+        if status.get("status") in ("identical", "ahead"):
+            return run["run_number"]
+    raise SystemExit(
+        f"no build of `{BRANCH}` among the {BASE_RUNS} newest ones which "
+        f"{merge_base[:10]} contains, give its number with --base-run"
+    )
+
+
+def build_number(
+    channel: Channel, run: dict, base_run: int | None = None
+) -> tuple[int, str | None]:
+    """The development number and the local version segment of a build.
+
+    The number of the run for a channel of upstream, and for a channel of a
+    fork the number of the build of upstream the patches sit on with the run
+    of the fork in the local segment, e.g. `2.11.1.dev655+patched.3`, see
+    `base_run_number`.
+
+    Args:
+        channel: the channel of the build.
+        run: the run which built it.
+        base_run: the number of the build of upstream to use, for a fork.
+
+    Returns:
+        The number of the development release and the local segment.
+    """
+    if channel.repo == UPSTREAM:
+        return run["run_number"], channel.local
+    number = base_run_number(channel, run["head_sha"], base_run)
+    run_number = run["run_number"]
+    local = f"{channel.local}.{run_number}" if channel.local else str(run_number)
+    return number, local
+
+
+def patch_commits(channel: Channel, head_sha: str) -> list[str]:
+    """The commits of a channel on top of the branch of upstream.
+
+    Returns:
+        The first line of the message of every commit which the build carries
+        on top of `develop` of upstream, empty for the channel of upstream and
+        when the comparison is not available.
+    """
+    if channel.repo == UPSTREAM:
+        return []
+    owner = channel.repo.split("/")[0]
+    try:
+        comparison = gh_api(f"repos/{UPSTREAM}/compare/{BRANCH}...{owner}:{head_sha}")
+    except subprocess.CalledProcessError:
+        return []
+    return [c["commit"]["message"].split("\n")[0] for c in comparison.get("commits", [])]
+
+
+def publish(
+    channel: Channel, run_id: int | None, dry_run: bool, base_run: int | None = None
+) -> None:
+    """Publish the wheels of a run of a channel.
+
+    Args:
+        channel: the channel to publish.
+        run_id: the run to publish, the latest one of the channel by default.
+        dry_run: print what would be published and publish nothing.
+        base_run: the number of the build of upstream a build of patches sits
+            on, looked up by `base_run_number` by default.
+
+    Raises:
+        SystemExit: when the run is not one of the channel, when it did not
+            succeed and the channel requires it, or when its wheels are not
+            the ones of the version of the branch.
+    """
+    run = (
+        gh_api(f"repos/{channel.repo}/actions/runs/{run_id}")
+        if run_id
+        else latest_run(channel)
+    )
+    if (run["head_branch"], run["event"]) != (channel.branch, channel.event):
+        raise SystemExit(
+            f"run {run['id']} is no {channel.event} of {channel.branch}"
+        )
+    if run["conclusion"] != "success":
+        if channel.require_success:
+            raise SystemExit(
+                f"run {run['id']} of {channel.branch} concluded {run['conclusion']}"
+            )
+        print(
+            f"run {run['id']} concluded {run['conclusion']}, "
+            "publishing the wheels it built"
+        )
+    artifacts = wheel_artifacts(channel, run["id"])
     base = next(iter(artifacts.values()))
-    version = build_version(base, run["run_number"], released_on_pypi("libroadrunner", base))
-    tag = f"v{version}"
+    number, local = build_number(channel, run, base_run)
+    version = build_version(
+        base,
+        number,
+        released_on_pypi("libroadrunner", base),
+        local,
+    )
+    tag = f"{channel.tag_prefix}{version}"
     github_output("version", version)
+    github_output("index", channel.index)
     if tag in existing_tags():
         print(f"{tag} is published already")
+        # the build was checked when it was published
+        github_output("runners", " ".join(RUNNERS.values()))
         return
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
-        wheels = download_wheels(run["id"], sorted(artifacts), tmp_path / "artifacts")
+        wheels, missing = download_wheels(
+            channel, run["id"], sorted(artifacts), tmp_path / "artifacts"
+        )
         if WheelName.parse(wheels[0].name).version != base:
             raise SystemExit(f"the wheels of run {run['id']} are not of version {base}")
         out = tmp_path / "wheels"
@@ -412,12 +740,40 @@ def publish(run_id: int | None, dry_run: bool) -> None:
             meta = new.with_name(new.name + ".metadata")
             meta.write_bytes(core_metadata(new))
             assets += [new, meta]
+        incomplete = (
+            f"\n\nThe build has no wheel for {', '.join(missing)}: the jobs "
+            "of these platforms did not build one."
+            if missing
+            else ""
+        )
+        patches = patch_commits(channel, run["head_sha"])
+        carried = (
+            "\n\nThe patches on top of `develop` of upstream:\n"
+            + "\n".join(f"- {message}" for message in patches)
+            if patches
+            else ""
+        )
+        concluded = (
+            "" if run["conclusion"] == "success" else f" (concluded `{run['conclusion']}`)"
+        )
         notes = (
-            f"The wheels of [{UPSTREAM}@{run['head_sha'][:10]}]"
-            f"(https://github.com/{UPSTREAM}/commit/{run['head_sha']}) on `{BRANCH}`, "
-            f"built by [run {run['run_number']}]({run['html_url']}), "
+            f"The wheels of [{channel.repo}@{run['head_sha'][:10]}]"
+            f"(https://github.com/{channel.repo}/commit/{run['head_sha']}) on "
+            f"`{channel.branch}`, built by [run {run['run_number']}]"
+            f"({run['html_url']}){concluded}, "
             f"version `{base}` renamed to `{version}`.\n\n"
-            f"Install with `--extra-index-url {PAGES_URL}/simple/`."
+            f"The channel `{channel.name}` is {channel.description}.\n\n"
+            f"Install with `--extra-index-url {PAGES_URL}/{channel.index}/`."
+            f"{carried}{incomplete}"
+        )
+        # the runners of the platforms the build has a wheel for
+        github_output(
+            "runners",
+            " ".join(
+                runner
+                for platform, runner in RUNNERS.items()
+                if not any(name.endswith(f"/{platform}") for name in missing)
+            ),
         )
         print(f"publishing {tag}: {', '.join(sorted(a.name for a in assets))}")
         if dry_run:
@@ -441,9 +797,23 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("publish", help="publish the latest successful build")
+    p.add_argument(
+        "--channel",
+        choices=sorted(CHANNELS),
+        default="develop",
+        help="the channel to publish, the branch of upstream by default",
+    )
     p.add_argument("--run", type=int, help="the id of a run instead of the latest")
+    p.add_argument(
+        "--base-run",
+        type=int,
+        help=(
+            "the number of the build of develop of upstream a build of "
+            "patches sits on, looked up by default"
+        ),
+    )
     p.add_argument("--dry-run", action="store_true")
-    i = sub.add_parser("index", help="write the index of the releases")
+    i = sub.add_parser("index", help="write the index of the releases of every channel")
     i.add_argument("--out", type=Path, required=True)
     r = sub.add_parser("reversion", help="give a wheel another version")
     r.add_argument("wheel", type=Path)
@@ -454,9 +824,13 @@ def main() -> None:
     li.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
     if args.command == "publish":
-        publish(args.run, args.dry_run)
+        publish(CHANNELS[args.channel], args.run, args.dry_run, args.base_run)
     elif args.command == "index":
-        write_index(release_files(), args.out)
+        latest = {
+            name: write_index(release_files(channel), args.out, channel)
+            for name, channel in CHANNELS.items()
+        }
+        write_front_page(latest, args.out)
     elif args.command == "reversion":
         print(reversion(args.wheel, args.version, args.out))
     elif args.command == "local-index":
@@ -476,7 +850,7 @@ def main() -> None:
                     requires_python=requires_python(meta),
                 )
             )
-        write_index(files, args.out)
+        write_front_page({"develop": write_index(files, args.out)}, args.out)
 
 
 if __name__ == "__main__":
