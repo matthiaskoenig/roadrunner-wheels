@@ -1,18 +1,36 @@
 name: sync
 
-# Publishes the wheels of the latest successful build of the branch `develop`
-# of sys-bio/roadrunner as a release of this repository, writes the package
-# index of all releases to GitHub Pages and, as the last step, installs the
-# published build from the index with uv and with pip on python 3.14 and 3.15
-# on every platform and simulates with it.
+# Publishes the wheels of the latest build of a channel as a release of this
+# repository, writes the package index of the releases of every channel to
+# GitHub Pages and, as the last step, installs the published build from its
+# index with uv and with pip on python 3.14 and 3.15 on every platform it has
+# a wheel for and simulates with it.
+#
+# The channels are `develop`, the branch of sys-bio/roadrunner, which the
+# schedule publishes, and `patched`, the branch `develop-patched` of the fork
+# matthiaskoenig/roadrunner, which is `develop` with the patches we carry on
+# top: dispatch `BuildRoadRunner` on that branch of the fork and then this
+# workflow with the channel `patched` (see sync.py).
 on:
   schedule:
     # daily, after the builds of the night
     - cron: "17 5 * * *"
   workflow_dispatch:
     inputs:
+      channel:
+        description: "The channel to publish"
+        required: false
+        default: develop
+        type: choice
+        options:
+          - develop
+          - patched
       run:
         description: "The id of a run of BuildRoadRunner to publish instead of the latest"
+        required: false
+        default: ""
+      base_run:
+        description: "The build of develop a build of patches sits on, looked up by default"
         required: false
         default: ""
   push:
@@ -32,16 +50,22 @@ jobs:
       contents: write
     outputs:
       version: ${{ steps.publish.outputs.version }}
+      index: ${{ steps.publish.outputs.index }}
+      runners: ${{ steps.publish.outputs.runners }}
     steps:
     - uses: actions/checkout@v7
       with:
         persist-credentials: false
-    - name: Publish the wheels of the latest build of develop
+    - name: Publish the wheels of the latest build of the channel
       id: publish
       env:
         GH_TOKEN: ${{ github.token }}
+        CHANNEL: ${{ inputs.channel || 'develop' }}
         RUN: ${{ inputs.run }}
-      run: python3 sync.py publish ${RUN:+--run "$RUN"}
+        BASE_RUN: ${{ inputs.base_run }}
+      run: >-
+        python3 sync.py publish --channel "$CHANNEL"
+        ${RUN:+--run "$RUN"} ${BASE_RUN:+--base-run "$BASE_RUN"}
 
   pages:
     needs: publish
@@ -70,10 +94,10 @@ jobs:
       uses: actions/deploy-pages@v5
 
   check:
-    # the published build from the index, as a user installs it (README):
-    # `uv sync` of a project with the source and `pip install
+    # the published build from the index of its channel, as a user installs it
+    # (README): `uv sync` of a project with the source and `pip install
     # --extra-index-url`, on the pythons of uv; the installed version must be
-    # the published one, so the index serves the newest build
+    # the published one, so the index serves the newest build of the channel
     name: check (${{ matrix.os }}, python ${{ matrix.python }}, ${{ matrix.installer }})
     needs: [publish, pages]
     runs-on: ${{ matrix.os }}
@@ -95,12 +119,20 @@ jobs:
       with:
         enable-cache: false
     - name: Install the published build and simulate
+      # the platforms the build has a wheel for: a build of our patches is
+      # published without the wheel of a platform whose jobs failed, and
+      # there is nothing to install on its runner. `matrix` is no context of
+      # the `if` of a job, so the step and not the job is skipped
+      if: contains(needs.publish.outputs.runners, matrix.os)
       env:
         VERSION: ${{ needs.publish.outputs.version }}
+        INDEX: ${{ needs.publish.outputs.index }}
+        PAGES: https://matthiaskoenig.github.io/roadrunner-wheels
         INSTALLER: ${{ matrix.installer }}
         PYTHON: ${{ matrix.python }}
       # GitHub Pages caches its pages for up to ten minutes
       run: >-
         uv run --no-project --python 3.14 check_install.py
-        --installer "$INSTALLER" --python "$PYTHON" --version "$VERSION" --wait 900
+        --installer "$INSTALLER" --python "$PYTHON" --version "$VERSION"
+        --index "$PAGES/$INDEX/" --wait 900
       shell: bash
